@@ -38,6 +38,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
 from torch.utils.data import ConcatDataset, DataLoader
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoProcessor,
                           CLIPVisionModel, LlavaConfig, CLIPImageProcessor,
+                          SiglipVisionModel,
                           LlavaForConditionalGeneration, LlavaProcessor)
 from transformers.utils.import_utils import (is_flash_attn_2_available,
                                              is_torch_sdpa_available)
@@ -181,10 +182,14 @@ def parse_args():
               'The maximum is 1; the larger the value, the less memory '
               'required for training. The default is 1, meaning all layers '
               'need to be re-computated.'))
+    # RECOMPUTE_MODULES 要改, 因为这样只支持 InternLM 和 CLIP, 不支持 SigLIP
+    # TODO: 感觉这是一个有很多trade-off空间的参数
     model_args.add_argument(
         '--shard-strategy',
         default='full',
-        choices=['full', 'hybrid', 'no', 'zero2'],
+        choices=['full', 'hybrid', 'no', 'zero2'], 
+        # full is close to zero3
+        # don't use hybrid for single node training
         help=('The sharding strategy to be used for distributed training.'))
     data_args = parser.add_argument_group('data', 'Dataset Related Settings')
     data_args.add_argument(
@@ -313,6 +318,7 @@ def parse_args():
 
 
 def is_interval(step, total_steps, interval):
+    '''check if we want to log or save the model at the current step'''
     return (step + 1) % interval == 0 or (step + 1) == total_steps
 
 
@@ -339,7 +345,11 @@ def build_llava_model(args, config, world_size, dtype=torch.float32,
                 with LoadWoInit():
                     llm = AutoModelForCausalLM.from_pretrained(
                         args.llm, config=_cfg.text_config)
-                    vit = CLIPVisionModel.from_pretrained(
+                    if "siglip" in args.vit.lower():
+                        vit = SiglipVisionModel.from_pretrained(
+                            args.vit, config=_cfg.vision_config)
+                    else:
+                        vit = CLIPVisionModel.from_pretrained(
                         args.vit, config=_cfg.vision_config)
                 llava.language_model = llm
                 llava.vision_tower = vit
@@ -730,7 +740,7 @@ def llava_sft(args):
             raise RuntimeError('The device does not support `bf16`, '
                                'please set `dtype` to `fp16`.')
     else:
-        raise RuntimeError('`dtype` only supports `fp16`，`bf16`, or `auto`, '
+        raise RuntimeError('`dtype` only supports `fp16`, `bf16`, or `auto`, '
                            f'but found {args.dtype}.')
 
     use_lora = args.llm_use_lora or args.vit_use_lora
@@ -779,7 +789,7 @@ def llava_sft(args):
     if args.llm_use_lora or args.vit_use_lora:
         policies.append(all_required_grad_wrap_policy)
 
-    if args.shard_strategy == 'full':
+    if args.shard_strategy == 'full': # close to zero3
         fsdp_device_mesh = dp_mesh
         strategy = ShardingStrategy.FULL_SHARD
     elif args.shard_strategy == 'no':
@@ -793,7 +803,7 @@ def llava_sft(args):
         strategy = ShardingStrategy.HYBRID_SHARD
     else:
         raise ValueError
-
+    # import pdb; pdb.set_trace() # # print(strategy)
     torch.cuda.reset_peak_memory_stats()
     shard_llava = FSDP(
         meta_llava,
@@ -818,6 +828,8 @@ def llava_sft(args):
             target=RECOMPUTE_MODULES,
             selective=args.selective_recompute)
         apply_activation_checkpointing(shard_llava, check_fn=check_fn)
+        # activation checkpointing 是什么: https://docs.oneflow.org/master/cookies/activation_checkpointing.html
+        # 
 
     fsdp_cost_time = time.time() - start_model_t
     logger.info(f'[Model] Cost {fsdp_cost_time:.2f}s')
@@ -992,17 +1004,17 @@ def llava_sft(args):
         if is_interval(step, total_steps, args.log_interval):
             logger.info(
                 f'[Train] (Epoch {epoch}) Step {step + 1}/{total_steps}  '  # noqa: E501
-                f'lr: {cur_lr:.6f}  loss: {step_loss:.3f}  '
+                f'lr: {cur_lr:.6f}  loss: {step_loss:.4f}  '
                 f'grad_norm: {grad_norm:.2f}  '
                 f'max_memory: {(max_memory / 1024 ** 3):.1f}GB  '
                 f'text_tokens: {step_text_tokens}  '
                 f'image_tokens: {step_img_tokens}  '
-                f'tgs: {tgs}  data_time: {step_data_time:.2f}s  '
-                f'time: {step_time:.2f}s  '
+                f'tgs: {tgs}  data_time: {step_data_time:.4f}s  '
+                f'time: {step_time:.4f}s  '
                 f'eta: {eta}')
 
         if is_interval(step, total_steps, checkpoint_interval):
-            torch.cuda.empty_cache()
+            torch.cuda.empty_cache() # release memory every checkpoint
             torch.cuda.reset_peak_memory_stats()
             max_memory = torch.cuda.max_memory_allocated()
             logger.info('[Checkpoint] Before saving checkpoint, the peak GPU '
@@ -1033,9 +1045,17 @@ def llava_sft(args):
                     merged_vit = saved_llava.vision_tower.merge_and_unload()
                     saved_llava.vision_tower = merged_vit
 
-                saved_llava.save_pretrained(hf_dir)
-                tokenizer.save_pretrained(hf_dir)
-                processor.save_pretrained(hf_dir)
+                # log the time of saving checkpoint
+                # ablate on the time of saving checkpoint
+                # save_function = dcp.save or save_function = torch.save
+                save_function = dcp.save
+                save_time_s = time.time()
+                saved_llava.save_pretrained(hf_dir, save_function=save_function) # , save_function=dcp.save
+                tokenizer.save_pretrained(hf_dir, save_function=save_function) # , save_function=dcp.save
+                processor.save_pretrained(hf_dir, save_function=save_function) # , dcp.save
+                save_time_e = time.time()
+                logger.info(f'[Checkpoint] Save checkpoint to {hf_dir} with {save_function}, '
+                            f'cost {save_time_e - save_time_s:.2f}s')
                 del saved_llava
 
             dist.barrier()
